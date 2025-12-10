@@ -13,27 +13,67 @@ See the Mulan PSL v2 for more details. */
 #include "common/sys/rc.h"
 #include "sql/operator/physical_operator.h"
 #include "sql/parser/parse.h"
+#include "common/value.h"
+#include "sql/expr/tuple_cell.h"
 #include <functional>
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
+#include <vector>
+#include <string>
 
 /**
  * @brief Hash Join 算子
  * @ingroup PhysicalOperator
  */
 struct HashKeyNode {
-  // LAB3 TODO
-  /*
-    定义用于存储哈希键的结构体成员
-    重载 == 运算符以便 HashKeyNode 可以作为哈希表的键
-  */
+  std::vector<Value> keys;  // 存储多个连接列的值
+  
+  bool operator==(const HashKeyNode& other) const {
+    if (keys.size() != other.keys.size()) {
+      return false;
+    }
+    for (size_t i = 0; i < keys.size(); i++) {
+      if (keys[i].compare(other.keys[i]) != 0) {
+        return false;
+      }
+    }
+    return true;
+  }
 };
+
 struct HashKeyNodeHasher {
-  // LAB3 TODO
-  /*
-    定义哈希函数以便 HashKeyNode 可以作为哈希表的键
-  */
+  std::size_t operator()(const HashKeyNode& node) const {
+    std::size_t hash = 0;
+    for (const auto& key : node.keys) {
+      // 使用简单的哈希组合方式
+      std::size_t key_hash = 0;
+      switch (key.attr_type()) {
+        case AttrType::INTS:
+          key_hash = std::hash<int>{}(key.get_int());
+          break;
+        case AttrType::FLOATS:
+          key_hash = std::hash<float>{}(key.get_float());
+          break;
+        case AttrType::CHARS: {
+          std::string str = key.get_string();
+          key_hash = std::hash<std::string>{}(str);
+          break;
+        }
+        case AttrType::DATES:
+          key_hash = std::hash<int>{}(key.get_int());
+          break;
+        case AttrType::BOOLEANS:
+          key_hash = std::hash<bool>{}(key.get_boolean());
+          break;
+        default:
+          key_hash = 0;
+          break;
+      }
+      hash = hash ^ (key_hash << 1);
+    }
+    return hash;
+  }
 };
 
 class HashJoinPhysicalOperator : public PhysicalOperator
@@ -65,12 +105,8 @@ public:
 private:
   RC left_next();   //! 左表遍历下一条数据
   RC right_next();  //! 右表遍历下一条数据，如果上一轮结束了就重新开始新的一轮
-  bool find_position(const TupleSchema& schemas, TupleCellSpec& spec, int& index);
-  RC get_hashkey_positions(Tuple* tuple, std::vector<int>& left_key_positions);
-  RC extract_hash_keys(Tuple* tuple, HashKeyNode&, std::vector<int>& left_key_positions);
-
-  // TODO: remove this func
-  // Expression *predicate() { return predicate_; }
+  RC get_hashkey_specs();  //! 从连接条件中提取哈希键的 TupleCellSpec
+  RC extract_hash_keys(Tuple* tuple, HashKeyNode& node, const std::vector<TupleCellSpec>& key_specs);
 
 private:
   Trx *trx_ = nullptr;
@@ -83,10 +119,17 @@ private:
   Tuple            *right_tuple_ = nullptr;
   JoinedTuple       joined_tuple_;         //! 当前关联的左右两个tuple
   
-  std::vector<int> left_key_positions_; // 存储左表哈希键在tuple中的位置
-  std::vector<int> right_key_positions_; // 存储右表哈希键在tuple中的位置
+  std::vector<TupleCellSpec> key_specs_;  // 存储等值条件的字段 TupleCellSpec（每对字段存两个）
   unique_ptr<Expression> join_conditions_; // 连接谓词表达式
   std::vector<Tuple*> left_tuples_; // 存储左表所有的tuple指针
-  using hashed_map_t = std::unordered_map<HashKeyNode,size_t, HashKeyNodeHasher>;
-  hashed_map_t hash_table_; // 哈希表
+  // 哈希表：key -> tuple索引列表
+  // 注意：当多个left tuple有相同的连接键值时，它们会被存储在同一个vector中
+  // std::unordered_map内部已经处理了哈希冲突（不同的key hash到同一个bucket）
+  using hashed_map_t = std::unordered_map<HashKeyNode, vector<size_t>, HashKeyNodeHasher>;
+  hashed_map_t hash_table_; // 哈希表，key -> tuple索引列表（支持一个key对应多个tuple）
+  
+  // Probe 阶段的辅助变量
+  size_t current_probe_tuple_index_ = 0;  // 当前 probe 的右表 tuple 索引
+  std::vector<size_t> current_matched_indices_;  // 当前右表 tuple 匹配的左表 tuple 索引列表
+  size_t current_match_index_ = 0;  // 当前正在输出的匹配索引
 };

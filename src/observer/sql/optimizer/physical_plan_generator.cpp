@@ -309,10 +309,52 @@ RC PhysicalPlanGenerator::create_plan(JoinLogicalOperator &join_oper, unique_ptr
     return RC::INTERNAL;
   }
   if (session->hash_join_on() && can_use_hash_join(join_oper)) {
-    // LAB3 TODO
-    /*
-      仿照 NestedLoopJoinPhysicalOperator 的创建方式，创建 HashJoinPhysicalOperator
-    */
+    // 创建 HashJoinPhysicalOperator
+    auto hash_join_oper = new HashJoinPhysicalOperator();
+    
+    // 为左右子算子创建物理算子
+    for (auto &child_oper : child_opers) {
+      unique_ptr<PhysicalOperator> child_physical_oper;
+      rc = create(*child_oper, child_physical_oper, session);
+      if (rc != RC::SUCCESS) {
+        LOG_WARN("failed to create physical child oper. rc=%s", strrc(rc));
+        delete hash_join_oper;
+        return rc;
+      }
+      
+      hash_join_oper->add_child(std::move(child_physical_oper));
+    }
+    
+    // 设置连接谓词
+    auto& predicates = join_oper.get_join_predicates();
+    if (!predicates.empty()) {
+      // 展开所有 AND 合取中的等值比较，统一打包成一个 AND ConjunctionExpr
+      vector<unique_ptr<Expression>> children;
+      auto collect = [&](unique_ptr<Expression> &expr) {
+        if (expr->type() == ExprType::CONJUNCTION) {
+          auto *conj = dynamic_cast<ConjunctionExpr *>(expr.get());
+          if (conj != nullptr && conj->conjunction_type() == ConjunctionExpr::Type::AND) {
+            for (auto &c : conj->children()) {
+              children.push_back(std::move(c));
+            }
+            return;
+          }
+        }
+        // 非合取或其他情况，直接作为一个子谓词
+        children.push_back(std::move(expr));
+      };
+
+      for (auto &pred : predicates) {
+        collect(pred);
+      }
+
+      if (!children.empty()) {
+        unique_ptr<ConjunctionExpr> conjunction_expr(
+            new ConjunctionExpr(ConjunctionExpr::Type::AND, children));
+        hash_join_oper->set_predicate(std::move(conjunction_expr));
+      }
+    }
+    oper.reset(hash_join_oper);
   } else {
     auto join_physical_oper = new NestedLoopJoinPhysicalOperator();
     for (auto &child_oper : child_opers) {
@@ -327,7 +369,28 @@ RC PhysicalPlanGenerator::create_plan(JoinLogicalOperator &join_oper, unique_ptr
     }
     auto& predicates = join_oper.get_join_predicates();
     if (!predicates.empty()) {
-      join_physical_oper->set_predicate(std::move(predicates[0]));
+      // 展开所有 AND 合取中的谓词，统一打包成一个 ConjunctionExpr
+      vector<unique_ptr<Expression>> children;
+      auto collect = [&](unique_ptr<Expression> &expr) {
+        if (expr->type() == ExprType::CONJUNCTION) {
+          auto *conj = dynamic_cast<ConjunctionExpr *>(expr.get());
+          if (conj != nullptr && conj->conjunction_type() == ConjunctionExpr::Type::AND) {
+            for (auto &c : conj->children()) {
+              children.push_back(std::move(c));
+            }
+            return;
+          }
+        }
+        children.push_back(std::move(expr));
+      };
+      for (auto& pred : predicates) {
+        collect(pred);
+      }
+      if (!children.empty()) {
+        // NLJ 的 set_predicate 要求必须是 ConjunctionExpr
+        unique_ptr<ConjunctionExpr> conj_expr(new ConjunctionExpr(ConjunctionExpr::Type::AND, children));
+        join_physical_oper->set_predicate(std::move(conj_expr));
+      }
     }
     oper.reset(join_physical_oper);
   }
@@ -336,11 +399,43 @@ RC PhysicalPlanGenerator::create_plan(JoinLogicalOperator &join_oper, unique_ptr
 
 bool PhysicalPlanGenerator::can_use_hash_join(JoinLogicalOperator &join_oper)
 {
-  // LAB3 TODO
-  /*
-    HashJoin 只能处理等值连接，本函数的任务是判断 JoinLogicalOperator 上的所有连接谓词都是等值比较
-    提示：可以使用 JoinLogicalOperator 上的 get_join_predicates() 方法获取连接谓词列表
-  */
+  // HashJoin 只能处理等值连接，本函数的任务是判断 JoinLogicalOperator 上的所有连接谓词都是等值比较
+  auto& predicates = join_oper.get_join_predicates();
+  
+  // 如果没有连接谓词，不能使用 hash join
+  if (predicates.empty()) {
+    return false;
+  }
+  
+  // 遍历所有连接谓词，检查是否都是等值连接
+  for (auto& predicate : predicates) {
+    if (predicate->type() == ExprType::CONJUNCTION) {
+      // ConjunctionExpr：需要检查其 children
+      auto* conj = dynamic_cast<ConjunctionExpr*>(predicate.get());
+      if (conj == nullptr || conj->conjunction_type() != ConjunctionExpr::Type::AND) {
+        return false;
+      }
+      for (auto& child : conj->children()) {
+        if (child->type() != ExprType::COMPARISON) {
+          return false;
+        }
+        auto* cmp_expr = dynamic_cast<ComparisonExpr*>(child.get());
+        if (cmp_expr == nullptr || cmp_expr->comp() != CompOp::EQUAL_TO || !cmp_expr->field_field_comparison()) {
+          return false;
+        }
+      }
+    } else if (predicate->type() == ExprType::COMPARISON) {
+      auto* cmp_expr = dynamic_cast<ComparisonExpr*>(predicate.get());
+      if (cmp_expr == nullptr || cmp_expr->comp() != CompOp::EQUAL_TO || !cmp_expr->field_field_comparison()) {
+        return false;
+      }
+    } else {
+      return false;
+    }
+  }
+  
+  // 所有连接谓词都是等值字段-字段比较，可以使用 hash join
+  return true;
 }
 
 RC PhysicalPlanGenerator::create_plan(CalcLogicalOperator &logical_oper, unique_ptr<PhysicalOperator> &oper, Session* session)

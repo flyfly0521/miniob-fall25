@@ -454,7 +454,11 @@ class CommandRunner:
     if result is False:
       return False
     data_l = data.strip().split('\n')
-    data_l.sort()
+    # 使用自然排序：数字按数值比较，而不是字符串比较
+    import re
+    def natural_sort_key(s):
+      return [int(c) if c.isdigit() else c for c in re.split(r'(\d+)', s)]
+    data_l.sort(key=natural_sort_key)
     data = '\n'.join(data_l) + '\n'
     self.__result_writer.write(data)
     return result
