@@ -454,7 +454,20 @@ class CommandRunner:
     if result is False:
       return False
     data_l = data.strip().split('\n')
-    data_l.sort()
+    
+    import re
+    def sort_key(s):
+        """
+        生成排序键：数字按数值排序，字符串按字典序排序
+        """
+        def try_num(x):
+            try:
+                return (0, float(x))
+            except ValueError:
+                return (1, x)
+        return [try_num(c) for c in re.split(r'(-?\d+\.?\d*)', s) if c]
+    
+    data_l.sort(key=sort_key)
     data = '\n'.join(data_l) + '\n'
     self.__result_writer.write(data)
     return result
